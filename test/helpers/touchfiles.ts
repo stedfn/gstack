@@ -126,6 +126,10 @@ export const E2E_TOUCHFILES: Record<string, string[]> = {
   'gemini-discover-skill':  ['.agents/skills/**', 'test/helpers/gemini-session-runner.ts', 'lib/worktree.ts'],
   'gemini-review-findings': ['review/**', '.agents/skills/gstack-review/**', 'test/helpers/gemini-session-runner.ts', 'lib/worktree.ts'],
 
+  // Debate
+  'debate-core':        ['debate/**', 'scripts/gen-skill-docs.ts', 'scripts/resolvers/preamble.ts'],
+  'debate-convergence': ['debate/**', 'codex/**', 'scripts/gen-skill-docs.ts'],
+
 
   // Coverage audit (shared fixture) + triage + gates
   'ship-coverage-audit': ['ship/**', 'test/fixtures/coverage-audit-fixture.ts', 'bin/gstack-repo-mode'],
@@ -286,6 +290,10 @@ export const E2E_TIERS: Record<string, 'gate' | 'periodic'> = {
   'codex-review-findings': 'periodic',
   'gemini-discover-skill': 'periodic',
   'gemini-review-findings': 'periodic',
+
+  // Debate — gate for core functional, periodic for convergence quality
+  'debate-core': 'gate',
+  'debate-convergence': 'periodic',
 
   // Design — gate for cheap functional, periodic for Opus/quality
   'design-consultation-core': 'periodic',

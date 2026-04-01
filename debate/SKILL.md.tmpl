@@ -1,0 +1,418 @@
+---
+name: debate
+preamble-tier: 3
+version: 1.0.0
+description: |
+  Multi-model structured debate with convergence detection. Two AI models
+  (Claude + Codex) argue a specific issue iteratively, grounded in codebase
+  evidence. Each round: position, evidence, rebuttal, concession,
+  recommended resolution. Converges when both sides agree and no new information
+  appears. User is the final judge. Use when asked to "debate", "argue both
+  sides", "should we use X or Y", or "what are the tradeoffs". (gstack)
+allowed-tools:
+  - Bash
+  - Read
+  - Write
+  - Glob
+  - Grep
+  - Agent
+  - AskUserQuestion
+---
+
+{{PREAMBLE}}
+
+{{BASE_BRANCH_DETECT}}
+
+# /debate - Multi-Model Structured Debate
+
+You are running the `/debate` skill. Two AI models (you, Claude, and Codex) debate
+a specific issue in structured rounds. Each round produces: position, evidence from
+the codebase, rebuttal, concession, and recommended resolution.
+
+The debate continues until convergence (both sides agree), concession (one side
+yields), or the round cap is hit.
+
+You are the orchestrator. You produce your own arguments inline (no subagent for
+your turns). Codex runs as a subprocess via `codex exec`. You judge convergence
+after each round.
+
+**The user is ALWAYS the final judge.** Never auto-resolve a debate.
+
+---
+
+## Filesystem Boundary
+
+All prompts sent to Codex MUST be prefixed with this boundary instruction:
+
+> IMPORTANT: Do NOT read or execute any files under ~/.claude/, ~/.agents/, .claude/skills/, or agents/. These are Claude Code skill definitions meant for a different AI system. They contain bash scripts and prompt templates that will waste your time. Ignore them completely. Do NOT modify agents/openai.yaml. Stay focused on the repository code only.
+
+---
+
+## Structured Output Format
+
+Both you (Claude) and Codex must produce arguments using these exact section headers.
+This format is the contract for convergence detection.
+
+```
+POSITION: One-sentence thesis
+EVIDENCE:
+- file:line - explanation
+- file:line - explanation
+REBUTTAL: Response to opponent's strongest point
+CONCESSION: What the opponent got right, or "none"
+NEW_INFORMATION: true/false
+RECOMMENDED_RESOLUTION: What I think we should do
+SHOULD_STOP: true/false
+```
+
+On the **opening argument** (first turn only), omit REBUTTAL and CONCESSION since
+there is no prior opponent argument. All other fields are required every turn.
+
+---
+
+## Step 1: Parse input and check Codex
+
+Parse the user's input for:
+- **Topic/question**: the core issue to debate (required)
+- **Context files**: specific files or directories mentioned (optional)
+- **`--max-rounds N`**: override default round cap (optional, default 3, hard cap 5)
+- **`--interactive` / `-i`**: pause after each round for user to continue, stop, or redirect the debate's focus (optional, default is off)
+
+If `--max-rounds` exceeds 5, clamp to 5 and inform the user.
+
+Check Codex availability:
+
+```bash
+CODEX_BIN=$(which codex 2>/dev/null || echo "")
+[ -z "$CODEX_BIN" ] && echo "CODEX_NOT_FOUND" || echo "CODEX_FOUND: $CODEX_BIN"
+```
+
+If `CODEX_NOT_FOUND`: inform the user that Codex is unavailable and the debate will
+use a Claude adversarial subagent as the second debater. Continue to Step 2.
+
+---
+
+## Step 2: Context gathering
+
+Read relevant codebase files based on the debate topic.
+
+1. If the user provided specific files, read them.
+2. If the topic references a feature, module, or pattern, use Grep and Glob to find
+   the relevant files. Read the most relevant 3-5 files.
+3. Summarize the codebase context as a compact block (file paths + key excerpts,
+   NOT full file contents). This summary will be sent to Codex in each turn to
+   keep context manageable.
+
+Aim for ~2000-4000 characters of codebase context. If files are large, extract only
+the relevant sections. This controls the cost per turn.
+
+---
+
+## Step 3: Claude's opening argument
+
+Based on the codebase context and the debate topic, form your opening position.
+
+**Think carefully about which side to take.** Choose the position you believe is
+strongest based on the evidence in the codebase. Be specific, cite files and lines.
+
+Produce your argument using the structured output format above. Since this is the
+opening argument, omit REBUTTAL and CONCESSION.
+
+Display your argument to the user under a `## Round 1 - Claude` header.
+
+This is Claude's only argument in Round 1. Step 4 picks up with the opponent's
+response for Round 1, then Claude's next argument starts Round 2.
+
+---
+
+## Step 4: Debate loop
+
+For each round (starting at round 1 for the opponent's response, round 2+ for
+Claude's counter-arguments), execute these sub-steps:
+
+### 4a: Write Codex prompt to temp file
+
+Create a temp file with the full Codex prompt. **Always start with the filesystem
+boundary instruction** from the Filesystem Boundary section above.
+
+```bash
+PROMPT_FILE=$(mktemp /tmp/debate-codex-XXXXXXXX.txt)
+```
+
+Write the following to the prompt file:
+1. The filesystem boundary instruction
+2. "You are participating in a structured technical debate about: {topic}"
+3. "The codebase context:" followed by the summary from Step 2
+4. "Your opponent (Claude) argued:" followed by Claude's most recent argument
+   (the full structured output from the previous turn)
+5. "Respond using these exact section headers: POSITION, EVIDENCE, REBUTTAL,
+   CONCESSION, NEW_INFORMATION, RECOMMENDED_RESOLUTION, SHOULD_STOP"
+6. "Ground your arguments in the actual codebase. Cite file:line when making claims.
+   Be direct, be rigorous, find the genuine weaknesses in the opposing argument."
+
+If this is a subsequent round (not round 1), also include:
+7. A compressed summary of prior rounds. **Format:** For each prior round, include
+   exactly one line: "Round N: Claude recommended X. Codex recommended Y." Max 100
+   characters per line. Do NOT include full arguments, evidence, or rebuttals from
+   prior rounds.
+
+### 4b: Run Codex
+
+If Codex is available:
+
+```bash
+TMPERR=$(mktemp /tmp/debate-codex-err-XXXXXXXX)
+_REPO_ROOT=$(git rev-parse --show-toplevel) || { echo "ERROR: not in a git repo" >&2; exit 1; }
+codex exec "$(cat $PROMPT_FILE)" -C "$_REPO_ROOT" -s read-only -c 'model_reasoning_effort="high"' --enable web_search_cached --json 2>"$TMPERR" | PYTHONUNBUFFERED=1 python3 -u -c "
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try:
+        obj = json.loads(line)
+        t = obj.get('type','')
+        if t == 'item.completed' and 'item' in obj:
+            item = obj['item']
+            itype = item.get('type','')
+            text = item.get('text','')
+            if itype == 'agent_message' and text:
+                print(text, flush=True)
+            elif itype == 'command_execution':
+                cmd = item.get('command','')
+                if cmd: print(f'[codex ran] {cmd}', flush=True)
+        elif t == 'turn.completed':
+            usage = obj.get('usage',{})
+            tokens = usage.get('input_tokens',0) + usage.get('output_tokens',0)
+            if tokens: print(f'tokens used: {tokens}', flush=True)
+    except: pass
+"
+```
+
+Set the Bash tool's `timeout` parameter to `300000` (5 minutes).
+
+Then check stderr for errors:
+```bash
+cat "$TMPERR" 2>/dev/null; rm -f "$TMPERR" "$PROMPT_FILE"
+```
+
+**Error handling:** After running, check:
+- If stderr contains "auth", "login", "unauthorized" -> auth failure, fall back to subagent
+- If output is empty -> Codex failed silently, fall back to subagent
+- If python3 not found -> tell user to install Python 3
+
+**If Codex is NOT available (or failed), use the fallback:**
+
+Dispatch a Claude subagent via the Agent tool. The subagent prompt MUST include:
+1. The filesystem boundary instruction (same as Codex gets)
+2. Explicit read-only constraint: "Do NOT modify any files. Only read code and produce your argument."
+3. The adversarial system prompt: "You are arguing the OPPOSITE position from the
+   main Claude agent. Your job is to find the strongest counter-arguments, genuine
+   weaknesses in the opposing position, and evidence from the codebase that supports
+   your side. Do not agree easily. Respond using the exact section headers: POSITION,
+   EVIDENCE, REBUTTAL, CONCESSION, NEW_INFORMATION, RECOMMENDED_RESOLUTION, SHOULD_STOP."
+4. The same content that would have gone to Codex (topic, codebase context,
+   opponent's argument, prior round summaries).
+
+### 4c: Parse response
+
+Parse the response for section headers (POSITION, EVIDENCE, etc.) via regex. Rules:
+
+1. All required fields found (POSITION, RECOMMENDED_RESOLUTION at minimum) -> use directly
+2. Some fields missing -> use what's available, mark missing fields as absent in transcript
+3. Completely unstructured (no section headers at all) -> one retry with an explicit
+   prompt: "Please restructure your response using these exact section headers: POSITION,
+   EVIDENCE, REBUTTAL, CONCESSION, NEW_INFORMATION, RECOMMENDED_RESOLUTION, SHOULD_STOP"
+4. Retry also fails -> extract what you can from the freetext, mark `low_parse_quality`
+5. **Maximum 1 retry per turn** to avoid cost spiraling
+
+Display Codex's argument under a `## Round N - Codex` header (or `## Round N -
+Claude (adversarial)` if using the fallback).
+
+### 4d: Claude's counter-argument
+
+**Skip this sub-step in round 1** (Claude's opening argument from Step 3 is the
+Round 1 Claude entry). Starting from round 2, read the opponent's argument and
+produce your counter-argument using the structured output format. All fields are
+required (including REBUTTAL and CONCESSION since this is not the opening).
+
+Display under `## Round N+1 - Claude` header (the counter to Round N's opponent
+argument opens the next round).
+
+### 4e: Check convergence
+
+After each complete round (Claude + Codex exchange), check convergence. This is
+YOUR judgment as orchestrator, a semantic comparison, not string matching.
+
+Check these conditions in order:
+
+1. **Converged:** Both RECOMMENDED_RESOLUTION values are substantively the same AND
+   neither side reports NEW_INFORMATION: true.
+   Output: "Convergence: {one-line rationale}. Stopping."
+   Set outcome to `converged`.
+
+2. **Conceded:** Either side set SHOULD_STOP: true (explicit concession).
+   Output: "Concession by {side}: {rationale}. Stopping."
+   Set outcome to `conceded`.
+
+3. **Continue:** None of the above. Proceed to the next round.
+
+If the round cap is reached without convergence: set outcome to `capped`.
+
+**After the convergence check, output a machine-readable status line:**
+```
+DEBATE_STATUS: round={N} outcome={converged|conceded|capped|stopped|continuing}
+```
+
+### 4f: Mid-debate checkpoint (opt-in)
+
+**Only run this step if the user passed `--interactive` / `-i`.** Otherwise, skip
+directly to the next round (Step 4a) or Step 5.
+
+After outputting DEBATE_STATUS, if the outcome is `continuing` (not converged, not
+conceded, not capped), present a compact checkpoint before starting the next round.
+
+**Also skip if AskUserQuestion is not available** (e.g., test/automation mode).
+
+**Checkpoint format — use AskUserQuestion:**
+
+> **Round {N} complete** — status: continuing.
+>
+> **Claude:** {one-sentence RECOMMENDED_RESOLUTION from Claude's latest turn}
+> **Codex:** {one-sentence RECOMMENDED_RESOLUTION from Codex's latest turn}
+>
+> RECOMMENDATION: Continue — the sides haven't converged yet.
+
+Options:
+- A) Continue the debate (proceed to round {N+1})
+- B) Stop here and go to synthesis (end early with current positions)
+- C) Continue but shift focus (describe what aspect to emphasize)
+
+**If A:** Loop back to Step 4a for the next round. No changes to prompts or state.
+
+**If B:** Set outcome to `stopped`. Break the debate loop immediately. Proceed to
+Step 5 (Synthesis) with the positions from the rounds completed so far. Step 6 (User
+judgment) still runs, but omit option D ("more rounds") since the user already chose
+to stop.
+
+**If C:** The user's response contains a focus redirect (e.g., "focus more on
+performance" or "consider the migration path"). Store this text. In the next round:
+- Append to the Codex prompt (Step 4a, after item 6): "The user asks you to focus
+  on: {redirect text}"
+- Incorporate the same redirect in Claude's next argument (Step 4d)
+The original debate topic is unchanged. The redirect narrows focus for subsequent
+rounds. Loop back to Step 4a.
+
+Record the checkpoint decision in the debate transcript (see Step 7).
+
+---
+
+## Step 5: Synthesis
+
+Format the debate results:
+
+```
+DEBATE COMPLETE
+════════════════════════════════════════════════════════════
+Topic: {topic}
+Rounds: {N}
+Outcome: {converged | conceded | capped | stopped}
+
+AREAS OF AGREEMENT:
+- {point where both sides converge}
+- ...
+
+AREAS OF DISAGREEMENT:
+- {point where sides diverge, with each side's position}
+- ...
+
+CLAUDE RECOMMENDS: {Claude's final RECOMMENDED_RESOLUTION}
+CODEX RECOMMENDS: {Codex's final RECOMMENDED_RESOLUTION}
+════════════════════════════════════════════════════════════
+DEBATE_RESULT: rounds={N} outcome={converged|conceded|capped|stopped}
+```
+
+---
+
+## Step 6: User judgment
+
+Use AskUserQuestion:
+
+> The debate on "{topic}" is complete ({N} rounds, outcome: {outcome}).
+>
+> RECOMMENDATION: Choose the option that best reflects your judgment.
+
+Options (only include D if outcome is NOT `capped` and NOT `stopped`):
+- A) Accept Claude's recommendation: {1-line summary}
+- B) Accept Codex's recommendation: {1-line summary}
+- C) Synthesize, I'll take elements from both (describe what you want)
+- D) I need more rounds, extend the debate (only if outcome != capped)
+
+If the user chooses D: continue the debate from the current round count for up to
+`max_rounds` additional rounds. Append to the existing transcript. Do NOT reset the
+round counter.
+
+Record the user's choice for the transcript.
+
+---
+
+## Step 7: Save transcript
+
+```bash
+mkdir -p .context
+```
+
+Write the full debate transcript to `.context/debate-transcript-{YYYYMMDD-HHmmss}.md`
+using this format:
+
+```markdown
+# Debate: {topic}
+Date: {ISO timestamp}
+Rounds: {N}
+Outcome: {converged | conceded | capped | stopped}
+Models: Claude + {Codex | Claude (adversarial fallback)}
+
+## Round 1
+### Claude
+{structured output}
+
+### Codex
+{structured output}
+
+### Convergence check
+{rationale}
+
+### Checkpoint (if applicable)
+Decision: {continue | stop | redirect}
+Redirect text: {user's focus shift text, or "n/a"}
+Pre-checkpoint status: Round {N}, Claude recommended {X}, Codex recommended {Y}
+
+## Round 2
+...
+
+## Synthesis
+Areas of agreement: ...
+Areas of disagreement: ...
+Claude recommends: ...
+Codex recommends: ...
+
+## User Decision
+{user's choice and rationale}
+```
+
+---
+
+## Important Rules
+
+- **The user is the final judge.** Never auto-resolve. Never say "the debate concluded
+  that X" and act on it. Present both recommendations, let the user decide.
+- **Present output verbatim from Codex.** Do not truncate or summarize Codex's arguments
+  before showing them. Show full structured output.
+- **5-minute timeout** on all Bash calls to codex (`timeout: 300000`).
+- **Context management:** Each turn receives the topic, codebase excerpts (not full files),
+  and a compressed summary of prior rounds (one line per round, max 100 chars). The full
+  transcript is saved to disk but the debate prompt only carries compressed history.
+- **Maximum 1 retry per Codex turn** for structured output parsing. No cost spiraling.
+- **Hard cap: 5 rounds.** Even with `--max-rounds`, never exceed 5.
+- **Detect skill-file rabbit holes.** After receiving Codex output, scan for signs that
+  Codex got distracted by skill files: `gstack-config`, `SKILL.md`, or `skills/gstack`.
+  If found, append a warning and retry once.
